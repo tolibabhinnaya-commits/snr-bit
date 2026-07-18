@@ -1,36 +1,46 @@
-name: SNR Scanner
+name: SNR Bot - Scan Terjadwal
 
 on:
   schedule:
+    # Jalan tiap 15 menit. Format cron: menit jam tanggal bulan hari
     - cron: "*/15 * * * *"
-  workflow_dispatch:
+  workflow_dispatch: {}   # tombol "Run workflow" manual di tab Actions
 
+# Supaya workflow boleh commit balik file cache dedup
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout repo
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install wheel setuptools
-          pip install ccxt pandas numpy python-dotenv
+        run: pip install -r requirements.txt
 
-      - name: Run bot
+      - name: Jalankan scan sekali
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SNR_TERMUX_NOTIF: "false"   # tidak relevan di server, matikan
+          SNR_EXCHANGE: "bybit"       # binance blokir IP US (server GitHub Actions)
+        run: python3 snr_bot_fixed.py --once
+
+      - name: Simpan cache dedup sinyal (kalau berubah)
         run: |
-          python snr_bot_fixed.py --once
+          if [ -n "$(git status --porcelain snr_sent_signals.json 2>/dev/null)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add snr_sent_signals.json
+            git commit -m "chore: update signal cache [skip ci]"
+            git push
+          else
+            echo "Tidak ada perubahan cache."
+          fi
