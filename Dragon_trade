@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+SNR TRADING SIGNAL BOT — FIXED VERSION
+=======================================
+Perubahan dari versi original:
+
+  [FIX 1 - KEAMANAN] Token Telegram TIDAK boleh hardcode di sini.
+    Baca dari environment variable. Cara set di Termux:
+      export TELEGRAM_BOT_TOKEN="token_baru_kamu"
+      export TELEGRAM_CHAT_ID="chat_id_kamu"
+    Atau buat file .env (perlu: pip install python-dotenv)
+
+  [FIX 2 - DEDUPLICATION] Sinyal yang sama tidak akan dikirim ulang
+    dalam waktu SIGNAL_CACHE_TTL_JAM jam. Tersimpan di file JSON lokal.
+
+  [FIX 3 - VALIDASI ENTRY] Sebelum kirim notifikasi, cek apakah
+    harga pasar saat ini masih relevan vs entry price di sinyal.
+    Cegah kirim sinyal BUY yang entry-nya sudah terlewat jauh.
+
+PERINGATAN:
+  Ini adalah alat bantu analisis teknikal otomatis, BUKAN nasihat
+  keuangan/finansial. Selalu lakukan validasi & manajemen risiko sendiri
+  sebelum mengambil keputusan trading. Trading punya risiko kerugian.
+  Hasil BACKTEST juga tidak menjamin performa yang sama di masa depan.
+
+CARA PAKAI DI TERMUX:
+  # Install dependensi
+  pkg install python
+  pip install ccxt pandas numpy
+
+  # (Opsional) Pakai .env file untuk simpan token:
+  pip install python-dotenv
+  echo 'TELEGRAM_BOT_TOKEN=token_kamu' > .env
+  echo 'TELEGRAM_CHAT_ID=chat_id_kamu' >> .env
+
+  # ATAU set langsung di shell (berlaku saat sesi aktif):
+  export TELEGRAM_BOT_TOKEN="token_baru_kamu"
+  export TELEGRAM_CHAT_ID="8625146544"
+
+  # Jalankan:
+  python3 snr_bot_fixed.py             # scan terus tiap interval
+  python3 snr_bot_fixed.py --once      # scan sekali saja
+  python3 snr_bot_fixed.py --backtest  # jalankan backtest
+"""
+
+import sys
+import os
+import time
+import json
+import hashlib
+import argparse
+import subprocess
+from pathlib import Path
+from datetime import datetime, timezone
+
+import pandas as pd
+import numpy as np
+import ccxt
+
+# Coba load .env file (opsional — perlu: pip install python-dotenv)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Tidak masalah, pakai export di shell
+
+
+# ========================================================================
+# ====================== KONFIGURASI =====================================
+# ========================================================================
+
+# ------ EXCHANGE & PAIR ------
+# Default: bybit. Binance memblokir akses API dari IP Amerika Serikat,
+# termasuk server GitHub Actions -> muncul error 451 kalau pakai binance di sana.
+# Bisa override via env: SNR_EXCHANGE="okx" / "bybit" / "binance" dst (harus didukung ccxt)
+EXCHANGE_ID = os.environ.get("SNR_EXCHANGE", "bybit")
+# Bisa override via env: SNR_SYMBOLS="BTC/USDT,ETH/USDT,SOL/USDT"
+SYMBOLS = [s.strip() for s in os.environ.get("SNR_SYMBOLS", "BTC/USDT,ETH/USDT").split(",")]
+TF_STRUKTUR            = os.environ.get("SNR_TF_STRUKTUR", "4h")
+TF_ENTRY               = os.environ.get("SNR_TF_ENTRY", "1h")
+JUMLAH_CANDLE_STRUKTUR = int(os.environ.get("SNR_CANDLE_STRUKTUR", "50"))
+JUMLAH_CANDLE_ENTRY    = int(os.environ.get("SNR_CANDLE_ENTRY", "100"))
+
+# ------ PARAMETER STRUKTUR (FRACTAL SWING) ------
+SWING_ORDER = 2
+
+# ------ PARAMETER LIQUIDITY ------
+LIQUIDITY_TOLERANCE_PCT = 0.15
+
+# ------ PARAMETER RISK MANAGEMENT ------
+SL_BUFFER_PCT  = float(os.environ.get("SNR_SL_BUFFER_PCT", "0.10"))
+MIN_RR         = float(os.environ.get("SNR_MIN_RR", "1.5"))
+RISK_PER_TRADE = 1.0
+
+# ------ VALIDASI ENTRY [FIX 3] ------
+# Toleransi (%): berapa jauh harga boleh meleset dari entry
+ENTRY_TOLERANSI_PCT = float(os.environ.get("SNR_ENTRY_TOL_PCT", "1.5"))
+
+# ------ NOTIFIKASI ------
+GUNAKAN_TERMUX_NOTIFICATION = os.environ.get("SNR_TERMUX_NOTIF", "true").lower() == "true"
+GUNAKAN_TELEGRAM            = os.environ.get("SNR_TELEGRAM", "true").lower() == "true"
+
+# [FIX 1] Baca dari environment variable — JANGAN hardcode di sini!
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# ------ LOOP SCANNER ------
+INTERVAL_SCAN_DETIK = int(os.environ.get("SNR_INTERVAL_DETIK", str(15 * 60)))
+
+# ------ DEDUPLICATION [FIX 2] ------
+SIGNAL_CACHE_FILE    = Path(os.environ.get("SNR_CACHE_FILE", "snr_sent_signals.json"))
+SIGNAL_CACHE_TTL_JAM = int(os.environ.get("SNR_CACHE_TTL_JAM", "24"))
+
+# ------ PARAMETER BACKTEST ------
+BACKTEST_CANDLE_ENTRY_TOTAL = 2000
+BACKTEST_MAX_LOOKAHEAD      = 200
+
+
+# ========================================================================
+# ========== [FIX 2] DEDUPLICATION SINYAL ================================
+# ========================================================================
+
+def _muat_cache() -> dict:
+    """Muat cache sinyal dari file JSON lokal."""
+    if not SIGNAL_CACHE_FILE.exists():
+        return {}
+    try:
+        return json.loads(SIGNAL_CACHE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _simpan_cache(cache: dict) -> None:
+    """Simpan cache sinyal ke file JSON lokal."""
+    try:
+        SIGNAL_CACHE_FILE.write_text(json.dumps(cache, indent=2, default=str), encoding="utf-8")
+    except Exception as e:
+        print(f"[!] Tidak bisa simpan cache sinyal: {e}")
+
+
+def sinyal_sudah_dikirim(sinyal: dict) -> bool:
+    """
+    [FIX 2] Cek duplikasi sinyal.
+    Return True  -> sinyal sudah pernah dikirim -> SKIP.
+    Return False -> sinyal baru -> tandai terkirim, lanjutkan.
+    Key: hash dari (symbol + arah + waktu OB).
+    """
+    ob_time  = str(sinyal["order_block"].get("time", ""))
+    key_str  = f"{sinyal['symbol']}_{sinyal['arah']}_{ob_time}"
+    sig_hash = hashlib.md5(key_str.encode()).hexdigest()
+
+    cache = _muat_cache()
+    now   = datetime.now(timezone.utc).timestamp()
+    ttl   = SIGNAL_CACHE_TTL_JAM * 3600
+
+    # Bersihkan entri expired
+    cache = {k: v for k, v in cache.items() if now - v < ttl}
+
+    if sig_hash in cache:
+        _simpan_cache(cache)
+        return True  # duplikat
+
+    cache[sig_hash] = now
+    _simpan_cache(cache)
+    return False
+
+
+# ========================================================================
+# ====================== ANALISIS ========================================
+# ========================================================================
+
+def deteksi_swing(df, order=SWING_ORDER):
+    df    = df.copy()
+    df["swing_high"] = False
+    df["swing_low"]  = False
+    highs = df["high"].values
+    lows  = df["low"].values
+    n     = len(df)
+    for i in range(order, n - order):
+        window_high = highs[i - order:i + order + 1]
+        window_low  = lows[i - order:i + order + 1]
+        if highs[i] == window_high.max() and np.argmax(window_high) == order:
+            df.iat[i, df.columns.get_loc("swing_high")] = True
+        if lows[i] == window_low.min() and np.argmin(window_low) == order:
+            df.iat[i, df.columns.get_loc("swing_low")] = True
+    return df
+
+
+def ambil_urutan_swing(df):
+    poin = []
+    for i, row in df.iterrows():
+        if row["swing_high"]:
+            poin.append({"idx": i, "time": row["timestamp"], "harga": row["high"], "tipe": "high"})
+        if row["swing_low"]:
+            poin.append({"idx": i, "time": row["timestamp"], "harga": row["low"],  "tipe": "low"})
+    poin.sort(key=lambda x: x["idx"])
+    return poin
+
+
+def klasifikasi_struktur(poin_swing):
+    last_high = None
+    last_low  = None
+    for p in poin_swing:
+        if p["tipe"] == "high":
+            p["label"] = "H" if last_high is None else ("HH" if p["harga"] > last_high else "LH")
+            last_high = p["harga"]
+        else:
+            p["label"] = "L" if last_low is None else ("HL" if p["harga"] > last_low else "LL")
+            last_low = p["harga"]
+    return poin_swing
+
+
+def tentukan_bias(poin_label):
+    highs = [p for p in poin_label if p["tipe"] == "high" and p["label"] in ("HH", "LH")]
+    lows  = [p for p in poin_label if p["tipe"] == "low"  and p["label"] in ("HL", "LL")]
+    if not highs or not lows:
+        return "sideways", None, None
+    lh, ll = highs[-1], lows[-1]
+    if lh["label"] == "HH" and ll["label"] == "HL":
+        return "bullish", lh, ll
+    elif lh["label"] == "LH" and ll["label"] == "LL":
+        return "bearish", lh, ll
+    return "sideways", lh, ll
+
+
+def bangun_zona_snr(df, bias, last_high, last_low):
+    if bias == "sideways" or last_high is None or last_low is None:
+        return None
+    rh = df.loc[last_high["idx"]]
+    rl = df.loc[last_low["idx"]]
+    if bias == "bullish":
+        return {"support": {"low": rl["low"], "high": rl["high"], "sumber": "HL"},
+                "resistance": {"low": rh["low"], "high": rh["high"], "sumber": "HH"}}
+    return {"support": {"low": rl["low"], "high": rl["high"], "sumber": "LL"},
+            "resistance": {"low": rh["low"], "high": rh["high"], "sumber": "LH"}}
+
+
+def deteksi_liquidity(poin_label, tolerance_pct=LIQUIDITY_TOLERANCE_PCT):
+    def cari_cluster(lst):
+        cluster, used = [], set()
+        for i, a in enumerate(lst):
+            if i in used: continue
+            grup = [a]
+            for j, b in enumerate(lst):
+                if j <= i or j in used: continue
+                if abs(a["harga"] - b["harga"]) / a["harga"] * 100 <= tolerance_pct:
+                    grup.append(b); used.add(j)
+            if len(grup) >= 2: cluster.append(grup)
+        return cluster
+    return (cari_cluster([p for p in poin_label if p["tipe"] == "high"]),
+            cari_cluster([p for p in poin_label if p["tipe"] == "low"]))
+
+
+def cari_order_block(df_entry, zona, bias, lookahead=4, min_impuls_pct=0.5):
+    if zona is None or bias not in ("bullish", "bearish"): return None
+    tz = zona["support"] if bias == "bullish" else zona["resistance"]
+    zl, zh, kandidat = tz["low"], tz["high"], []
+    for i in range(len(df_entry) - lookahead):
+        row = df_entry.iloc[i]
+        if row["high"] < zl or row["low"] > zh: continue
+        if bias == "bullish" and row["close"] < row["open"]:
+            w = df_entry.iloc[i+1:i+1+lookahead]
+            if not w.empty:
+                mc = w["close"].max()
+                if mc > row["high"] and (mc - row["high"])/row["high"]*100 >= min_impuls_pct:
+                    kandidat.append((i, row))
+        elif bias == "bearish" and row["close"] > row["open"]:
+            w = df_entry.iloc[i+1:i+1+lookahead]
+            if not w.empty:
+                mc = w["close"].min()
+                if mc < row["low"] and (row["low"] - mc)/row["low"]*100 >= min_impuls_pct:
+                    kandidat.append((i, row))
+    if not kandidat: return None
+    oi, ob = kandidat[-1]
+    return {"idx_local": oi, "time": ob["timestamp"],
+            "open": ob["open"], "high": ob["high"], "low": ob["low"], "close": ob["close"]}
+
+
+def buat_sinyal(symbol, df_struktur, df_entry):
+    df_s = deteksi_swing(df_struktur)
+    poin = klasifikasi_struktur(ambil_urutan_swing(df_s))
+    bias, last_high, last_low = tentukan_bias(poin)
+    if bias == "sideways":
+        return {"symbol": symbol, "status": "no_signal", "alasan": "Struktur 4H belum jelas (sideways/transisi)"}
+    zona = bangun_zona_snr(df_s, bias, last_high, last_low)
+    la, lb = deteksi_liquidity(poin)
+    ob = cari_order_block(df_entry, zona, bias)
+    if ob is None:
+        return {"symbol": symbol, "status": "no_signal",
+                "alasan": f"Bias {bias}, tapi belum ada Order Block valid di zona SNR (1H)"}
+    buf = SL_BUFFER_PCT / 100
+    if bias == "bullish":
+        entry, sl, tp, arah = ob["high"], ob["low"]*(1-buf), zona["resistance"]["high"], "BUY"
+    else:
+        entry, sl, tp, arah = ob["low"], ob["high"]*(1+buf), zona["support"]["low"], "SELL"
+    risiko = abs(entry - sl); reward = abs(tp - entry)
+    rr = round(reward/risiko, 2) if risiko > 0 else 0
+    return {"symbol": symbol, "status": "VALID" if rr >= MIN_RR else "RR_KURANG",
+            "bias": bias, "arah": arah, "entry": round(entry,6), "sl": round(sl,6), "tp": round(tp,6), "rr": rr,
+            "zona_support": zona["support"], "zona_resistance": zona["resistance"], "order_block": ob,
+            "liquidity_atas_count": len(la), "liquidity_bawah_count": len(lb)}
+
+
+# ========================================================================
+# ====================== DATA CANDLESTICK ================================
+# ========================================================================
+
+def ambil_ohlcv(exchange, symbol, timeframe, limit):
+    data = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    df   = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    return df
+
+
+def ambil_ohlcv_banyak(exchange, symbol, timeframe, total):
+    tf_ms = exchange.parse_timeframe(timeframe) * 1000
+    semua, limit_per_req = [], 1000
+    since = exchange.milliseconds() - total * tf_ms
+    while len(semua) < total:
+        batch = exchange.fetch_ohlcv(symbol, timeframe=timeframe, since=since, limit=limit_per_req)
+        if not batch: break
+        semua.extend(batch); since = batch[-1][0] + tf_ms
+        if len(batch) < limit_per_req and since >= exchange.milliseconds(): break
+        time.sleep(exchange.rateLimit / 1000)
+    df = pd.DataFrame(semua, columns=["timestamp","open","high","low","close","volume"])
+    df = df.drop_duplicates(subset="timestamp").sort_values("timestamp").reset_index(drop=True)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    if len(df) > total: df = df.iloc[-total:].reset_index(drop=True)
+    return df
+
+
+# ========================================================================
+# ========== [FIX 3] VALIDASI ENTRY VS HARGA SAAT INI ===================
+# ========================================================================
+
+def validasi_entry_relevan(exchange, sinyal: dict):
+    """
+    [FIX 3] Cek apakah entry price masih relevan vs harga pasar SAAT INI.
+    BUY  -> valid jika harga belum lebih dari ENTRY_TOLERANSI_PCT di atas entry.
+    SELL -> valid jika harga belum lebih dari ENTRY_TOLERANSI_PCT di bawah entry.
+    Fail-open: jika gagal fetch ticker, sinyal tetap dikirim.
+    Return: (valid: bool, keterangan: str)
+    """
+    try:
+        harga = exchange.fetch_ticker(sinyal["symbol"])["last"]
+        entry = sinyal["entry"]
+        diff  = (harga - entry) / entry * 100  # positif = harga > entry
+        if sinyal["arah"] == "BUY" and diff > ENTRY_TOLERANSI_PCT:
+            return False, f"Entry TERLEWAT — harga {harga:.6f} sudah {diff:.2f}% di atas entry {entry:.6f}"
+        if sinyal["arah"] == "SELL" and diff < -ENTRY_TOLERANSI_PCT:
+            return False, f"Entry TERLEWAT — harga {harga:.6f} sudah {abs(diff):.2f}% di bawah entry {entry:.6f}"
+        return True, f"Entry RELEVAN — harga: {harga:.6f}, entry: {entry:.6f}, diff: {diff:+.2f}%"
+    except Exception as e:
+        return True, f"[!] Tidak bisa cek harga ({e}) — sinyal dikirim tanpa validasi harga"
+
+
+# ========================================================================
+# ====================== NOTIFIKASI =====================================
+# ========================================================================
+
+def kirim_termux_notification(judul, isi):
+    try:
+        subprocess.run(["termux-notification","--title",judul,"--content",isi], check=False)
+    except FileNotFoundError:
+        print("[!] termux-notification tidak ditemukan. Install paket termux-api & app Termux:API.")
+
+
+def kirim_telegram(pesan):
+    import urllib.request, urllib.parse
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[!] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID belum diset!")
+        print("    Cara set: export TELEGRAM_BOT_TOKEN='token_kamu'")
+        return
+    url  = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT_ID, "text": pesan, "parse_mode": "Markdown"}).encode()
+    try:
+        urllib.request.urlopen(url, data=data, timeout=10)
+    except Exception as e:
+        print(f"[!] Gagal kirim Telegram: {e}")
+
+
+def format_sinyal(sinyal):
+    if sinyal["status"] == "no_signal":
+        return f"[{sinyal['symbol']}] Tidak ada sinyal. Alasan: {sinyal['alasan']}"
+    emoji = "🟢" if sinyal["arah"] == "BUY" else "🔴"
+    ket   = "VALID" if sinyal["status"] == "VALID" else "RR di bawah minimum"
+    return (f"{emoji} SINYAL {sinyal['arah']} - {sinyal['symbol']} ({ket})\n"
+            f"Bias 4H          : {sinyal['bias'].upper()}\n"
+            f"Entry (OB)       : {sinyal['entry']}\n"
+            f"Stop Loss        : {sinyal['sl']}\n"
+            f"Take Profit      : {sinyal['tp']}\n"
+            f"Risk:Reward      : 1:{sinyal['rr']}\n"
+            f"Zona Support     : {sinyal['zona_support']['low']} - {sinyal['zona_support']['high']} ({sinyal['zona_support']['sumber']})\n"
+            f"Zona Resistance  : {sinyal['zona_resistance']['low']} - {sinyal['zona_resistance']['high']} ({sinyal['zona_resistance']['sumber']})\n"
+            f"Order Block      : O:{sinyal['order_block']['open']} H:{sinyal['order_block']['high']} L:{sinyal['order_block']['low']} C:{sinyal['order_block']['close']}\n"
+            f"Liquidity pool   : {sinyal['liquidity_atas_count']} di atas, {sinyal['liquidity_bawah_count']} di bawah")
+
+
+# ========================================================================
+# ====================== SCAN UTAMA =====================================
+# ========================================================================
+
+def scan_sekali(exchange):
+    print(f"\n===== SCAN {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} =====")
+    for symbol in SYMBOLS:
+        try:
+            df_struktur = ambil_ohlcv(exchange, symbol, TF_STRUKTUR, JUMLAH_CANDLE_STRUKTUR)
+            df_entry    = ambil_ohlcv(exchange, symbol, TF_ENTRY, JUMLAH_CANDLE_ENTRY)
+            sinyal = buat_sinyal(symbol, df_struktur, df_entry)
+            print("-" * 60); print(format_sinyal(sinyal))
+            if sinyal["status"] == "VALID":
+                relevan, ket = validasi_entry_relevan(exchange, sinyal)
+                print(f"  -> {ket}")
+                if not relevan:
+                    print("  -> Sinyal DILEWATI (entry terlewat)"); continue
+                if sinyal_sudah_dikirim(sinyal):
+                    print("  -> Sinyal DILEWATI (duplikat)"); continue
+                if GUNAKAN_TERMUX_NOTIFICATION:
+                    kirim_termux_notification(f"Sinyal {sinyal['arah']} {symbol}", format_sinyal(sinyal))
+                if GUNAKAN_TELEGRAM:
+                    kirim_telegram(format_sinyal(sinyal)); print("  -> Sinyal dikirim ke Telegram")
+        except Exception as e:
+            print(f"[!] Error saat proses {symbol}: {e}")
+
+
+# ========================================================================
+# ======================== BACKTEST =====================================
+# ========================================================================
+
+def _cari_bias_di_waktu(df_struktur_full, waktu_batas):
+    w = df_struktur_full[df_struktur_full["timestamp"] <= waktu_batas].tail(JUMLAH_CANDLE_STRUKTUR)
+    if len(w) < JUMLAH_CANDLE_STRUKTUR: return None, None, None, None
+    w = w.reset_index(drop=True)
+    df_s = deteksi_swing(w); poin = klasifikasi_struktur(ambil_urutan_swing(df_s))
+    bias, lh, ll = tentukan_bias(poin)
+    return bias, (bangun_zona_snr(df_s, bias, lh, ll) if bias != "sideways" else None), lh, ll
+
+
+def backtest_symbol(exchange, symbol, total_candle_entry=BACKTEST_CANDLE_ENTRY_TOTAL,
+                     max_lookahead=BACKTEST_MAX_LOOKAHEAD, verbose=True):
+    if verbose: print(f"\n[Backtest] Mengambil data historis untuk {symbol} ...")
+    df_entry_full    = ambil_ohlcv_banyak(exchange, symbol, TF_ENTRY, total_candle_entry)
+    n_struct         = int(total_candle_entry * 1.2) // 4 + JUMLAH_CANDLE_STRUKTUR + 20
+    df_struktur_full = ambil_ohlcv_banyak(exchange, symbol, TF_STRUKTUR, n_struct)
+    trades, i, n     = [], JUMLAH_CANDLE_ENTRY, len(df_entry_full)
+    while i < n:
+        wkt = df_entry_full.iloc[i]["timestamp"]
+        bias, zona, lh, ll = _cari_bias_di_waktu(df_struktur_full, wkt)
+        if bias in (None, "sideways") or zona is None: i += 1; continue
+        dew = df_entry_full[df_entry_full["timestamp"] <= wkt].tail(JUMLAH_CANDLE_ENTRY)
+        if len(dew) < JUMLAH_CANDLE_ENTRY: i += 1; continue
+        dew = dew.reset_index(drop=True)
+        ob = cari_order_block(dew, zona, bias)
+        if ob is None: i += 1; continue
+        buf = SL_BUFFER_PCT / 100
+        if bias == "bullish": entry,sl,tp,arah = ob["high"],ob["low"]*(1-buf),zona["resistance"]["high"],"BUY"
+        else:                 entry,sl,tp,arah = ob["low"],ob["high"]*(1+buf),zona["support"]["low"],"SELL"
+        rr = round(abs(tp-entry)/abs(entry-sl), 2) if abs(entry-sl) > 0 else 0
+        if rr < MIN_RR: i += 1; continue
+        hasil, idx_s = "TIMEOUT", min(i+max_lookahead, n-1)
+        for j in range(i+1, min(i+1+max_lookahead, n)):
+            r = df_entry_full.iloc[j]
+            sl_hit = r["low"]<=sl  if arah=="BUY" else r["high"]>=sl
+            tp_hit = r["high"]>=tp if arah=="BUY" else r["low"]<=tp
+            if sl_hit: hasil="LOSS"; idx_s=j; break
+            if tp_hit: hasil="WIN";  idx_s=j; break
+        trades.append({"symbol":symbol,"waktu_entry":wkt,"bias":bias,"arah":arah,
+                        "entry":round(entry,6),"sl":round(sl,6),"tp":round(tp,6),"rr":rr,"hasil":hasil})
+        i = idx_s + 1
+    return rangkum_backtest(symbol, trades)
+
+
+def rangkum_backtest(symbol, trades):
+    w,l,t = (sum(1 for x in trades if x["hasil"]==k) for k in ("WIN","LOSS","TIMEOUT"))
+    s = w+l
+    return {"symbol":symbol,"total_sinyal":len(trades),"win":w,"loss":l,"timeout":t,
+            "winrate_pct":round(w/s*100,2) if s else 0,
+            "avg_rr":round(sum(x["rr"] for x in trades)/len(trades),2) if trades else 0,
+            "expectancy_r":round(sum((x["rr"] if x["hasil"]=="WIN" else -1) for x in trades if x["hasil"] in ("WIN","LOSS"))/s,2) if s else 0,
+            "trades":trades}
+
+
+def format_ringkasan_backtest(r):
+    return (f"\n===== HASIL BACKTEST: {r['symbol']} =====\n"
+            f"Total sinyal (VALID, RR>={MIN_RR}) : {r['total_sinyal']}\n"
+            f"Menang (TP kena)                   : {r['win']}\n"
+            f"Kalah (SL kena)                    : {r['loss']}\n"
+            f"Timeout                            : {r['timeout']}\n"
+            f"Win rate (dari yg selesai)         : {r['winrate_pct']}%\n"
+            f"Rata-rata RR sinyal                : 1:{r['avg_rr']}\n"
+            f"Expectancy per trade               : {r['expectancy_r']} R\n")
+
+
+def jalankan_backtest(exchange):
+    print("="*70); print("MEMULAI BACKTEST — hanya simulasi historis, BUKAN jaminan hasil ke depan."); print("="*70)
+    semua = []
+    for symbol in SYMBOLS:
+        try:
+            r = backtest_symbol(exchange, symbol); semua.append(r); print(format_ringkasan_backtest(r))
+            if r["trades"]:
+                print("Contoh 5 trade terakhir:")
+                for t in r["trades"][-5:]:
+                    print(f"  {t['waktu_entry']} | {t['arah']} | entry={t['entry']} sl={t['sl']} tp={t['tp']} rr=1:{t['rr']} -> {t['hasil']}")
+        except Exception as e: print(f"[!] Error backtest {symbol}: {e}")
+    if semua:
+        tw=sum(r["win"] for r in semua); tl=sum(r["loss"] for r in semua); ts=tw+tl
+        print("="*70); print(f"GABUNGAN -> Win:{tw} | Loss:{tl} | Winrate:{round(tw/ts*100,2) if ts else 0}%"); print("="*70)
+
+
+# ========================================================================
+# ============================== MAIN ====================================
+# ========================================================================
+
+def cek_konfigurasi():
+    if GUNAKAN_TELEGRAM and (not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID):
+        print("="*65)
+        print("PERINGATAN: Telegram belum dikonfigurasi!")
+        print("  export TELEGRAM_BOT_TOKEN='token_baru_kamu'")
+        print("  export TELEGRAM_CHAT_ID='chat_id_kamu'")
+        print("="*65)
+
+
+def main():
+    global BACKTEST_CANDLE_ENTRY_TOTAL
+    parser = argparse.ArgumentParser(description="SNR Trading Signal Bot - Fixed Version")
+    parser.add_argument("--once",             action="store_true")
+    parser.add_argument("--backtest",         action="store_true")
+    parser.add_argument("--backtest-candles", type=int, default=BACKTEST_CANDLE_ENTRY_TOTAL)
+    args = parser.parse_args()
+    cek_konfigurasi()
+    exchange = getattr(ccxt, EXCHANGE_ID)({"enableRateLimit": True})
+    if args.backtest:
+        BACKTEST_CANDLE_ENTRY_TOTAL = args.backtest_candles
+        jalankan_backtest(exchange); return
+    if args.once:
+        scan_sekali(exchange); return
+    print(f"Bot SNR (Fixed) aktif. Scan setiap {INTERVAL_SCAN_DETIK//60} menit. CTRL+C untuk berhenti.")
+    while True:
+        try:
+            scan_sekali(exchange)
+        except KeyboardInterrupt:
+            print("\nBot dihentikan."); sys.exit(0)
+        except Exception as e:
+            print(f"[!] Error: {e}")
+        time.sleep(INTERVAL_SCAN_DETIK)
+
+
+if __name__ == "__main__":
+    main()
